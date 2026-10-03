@@ -62,6 +62,9 @@ API_PREFIX = "/api/v1"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动升级（建表/旧库补列/索引/版本 0 基线，单事务、可恢复）：
+    # 任一步失败即整体回滚并抛出异常，lifespan 启动失败，进程不对外服务；
+    # 修复后重新启动即从头重试（升级幂等）。
     init_db()
     if config.SEED_ON_START:
         # 仅当库中尚无样本时写入演示数据，重启不重复

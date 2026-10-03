@@ -81,6 +81,45 @@ python -m app.seed              # 可选：初始化演示数据（幂等，可�
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
 
+### 启动升级（一次性、可恢复）与故障恢复
+
+每次启动（容器入口与本地 uvicorn 相同）都会先执行**启动升级**，把以下四步作为**一次**升级在**单个事务**中完成：
+
+1. **建表**（含升级标记表 `schema_meta`）；
+2. **旧库补列**（`custody_event.superseded_by / replaces_event_id / batch_id`、`review.reviewer_person_id`）；
+3. **索引**（含依赖新列的索引）；
+4. **版本 0 基线**：为尚无版本的旧样本以**升级时状态**补建 `baseline` 版本 0（仅反映当时的有效保管链与核定状态，不推断更早历史；已有任何版本的样本跳过）。
+
+保证与行为：
+
+- **全有或全无**：任一步失败，整个事务回滚——不会留下"只补了列没建基线"之类的部分升级结果；全部步骤提交后才把结构版本写入 `schema_meta` 标记。
+- **失败进程不对外服务**：升级失败即终止启动（容器入口非零退出、本地 uvicorn 启动失败退出），端口不监听；不会以半升级状态接收请求。
+- **并发启动安全**：同一持久库被两个服务进程同时启动时，先到进程持写锁完成升级；后到进程在写锁上等待后**沿用已完成状态**——每份旧样本的版本 0 基线只构建一次，不重复构建。锁竞争超时自动退避重试。
+- **可恢复**：升级幂等，故障排除后**直接重启**即从头重试；已有版本、案卷、复核记录一律不重写。
+
+故障恢复用法：
+
+```bash
+# Docker：升级失败时容器非零退出，restart 策略自动重试；查看日志确认
+docker compose logs -f          # 看到 "[init_db] 启动升级完成：结构版本 1，补建版本 0 基线 N 条" 或无升级输出即正常
+docker compose restart          # 手动重试升级（幂等，可任意重复）
+
+# 本地：排除故障（如磁盘/权限问题）后重新执行原启动命令即可
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8080
+```
+
+升级完成后，既有样本、版本与案卷 HTTP 查询保持可调用且响应含义不变。调用示例（以旧样本 `OLD-A`、旧案卷 `DOSSIER-001` 为例）：
+
+```bash
+curl http://localhost:8080/api/v1/samples                       # 样本核验摘要（evaluation 含 current_version）
+curl http://localhost:8080/api/v1/samples/OLD-A/chain           # 完整证据链（结论/原因/保管人含义不变）
+curl http://localhost:8080/api/v1/samples/OLD-A/versions        # 版本索引：旧样本版本 0 为 baseline 基线
+curl http://localhost:8080/api/v1/samples/OLD-A/versions/0      # 升级基线快照（升级时有效链与核定状态）
+curl http://localhost:8080/api/v1/samples/OLD-A/versions/latest # 当前最新版本快照
+curl http://localhost:8080/api/v1/dossiers/DOSSIER-001          # 升级前封存的案卷原样可查
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/verify   # 案卷摘要核验（match=true）
+```
+
 ---
 
 ## 三、服务地址与端口
@@ -1416,6 +1455,7 @@ python -m tests.test_identities     # 人员标识与复核回避：67 项断言
 python -m tests.test_temperature    # 运输测温证据：83 项断言（含并发）
 python -m tests.test_calibrations   # 设备校准证明与可信复核：58 项断言（含并发）
 python -m tests.test_dispositions   # 可信测温异常处置：69 项断言（含失效对账与并发）
+python -m tests.test_startup_upgrade # 启动升级：47 项断言（含失败回滚、并发启动、旧库基线）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
@@ -1429,6 +1469,7 @@ python -m tests.test_dispositions   # 可信测温异常处置：69 项断言（
 - `test_temperature` 覆盖：测温配置一次性设定（同内容幂等/异内容冲突/区间与间隔及有限数值校验/未知样本 404）、读数记录（未配置 409、采集前 422、重复发生时刻 409 含时区归一、同号同内容返回原记录/同号异内容 409、非有限数值 422）、复核查询（超温点方向与限值、边界值在范围内、缺测区间严格大于限值才报、跨移交/签收拆分、入库不拆分、逐段归属保管人/在途）、断链待核三情形（非保管人移交/签收无在途/在途再移交）与不触发待核两情形（签收要素不符、重复签收）、乱序补录与移交/签收纠错后归属重算且原始读数与旧纠错记录不改、核定后拒绝新配置与读数（同号同内容重试仍幂等）、测温数据不影响核验结论且不产生版本、空读数与间隔边界、并发（同号同内容一建一幂等、同号异内容与同时刻一胜一败、配置并发一建一幂等/一建一冲突）。
 - `test_calibrations` 覆盖：无读数设备/空时段/反序时段/空白签发人拒绝且不留记录，同号同内容幂等（时区归一）与异内容冲突，同设备有效区间重叠拒绝、端点相邻允许、不同设备可重叠，逐条可信匹配（有证、未登记证明、早于/晚于有效期、证明空档、证明已作废、结束点不含），无有证读数明确 `unable_to_assess`，仅用有证读数计算超温与相邻有证读数缺测并沿用保管链拆分，补录/作废即时重算且原读数、既有测温查询与保管链版本不变，作废幂等/异理由冲突/未知证明，作废后释放重叠限制，核定后仍可补录/作废证明，同号同内容并发一建一幂等、重叠证明并发一胜一败且失败不留记录。
 - `test_dispositions` 覆盖：异常查询稳定标识（`oor:<读数号>`/`gap:<前后读数号>`）、证据摘要、时间范围、相关读数与校准证明、在途/保管人/待核归属与 `attribution_pending`，认可/排除提交与字段校验，同一异常同一摘要仅一次（409 附原单号）、同单号同内容 200 幂等（含失效后重试）与异内容/换异常/跨样本 409，异常消失与摘要过期 422 `anomaly_stale` 且整单不留痕、未知/未配置/未知样本/路径不一致，保管链纠错致归属变化旧意见 `evidence_changed` 失效且新摘要可重新处置、失效意见不复活，证明作废致 `anomaly_gone` 与补证后重现、读数补录拆分缺测，断链待核异常处置，台账与 `status` 过滤（含未配置样本历史可读）、异常消失计数，核定后仍可处置且不产生版本/不污染可信复核，并发同摘要一 201 一 409、同单号同内容一 201 一 200。
+- `test_startup_upgrade` 覆盖：旧库（缺列、无版本表）一次性升级（补列/建表/索引/每份旧样本恰好一个 baseline 版本 0、基线反映升级时有效链与核定状态）、升级幂等重跑零变化、任一步失败整体回滚不留部分结果且恢复后重跑成功、升级失败时 lifespan 启动失败（失败进程不对外服务）、并发启动同一持久库每份旧样本只构建一次基线且后到进程沿用已完成状态、已有版本/案卷/复核记录重跑升级后逐行不变、升级完成后样本/版本/案卷 HTTP 查询可调用且响应含义不变（含升级后版本从 1 继续递增、已核定样本保持冻结）。
 
 ---
 
@@ -1448,7 +1489,7 @@ python -m tests.test_dispositions   # 可信测温异常处置：69 项断言（
 │   ├── calibrations.py # 设备校准证明：补录登记、左闭右开有效期/重叠校验、按号作废、可信证明匹配与有证读数复核
 │   ├── dispositions.py # 可信测温异常处置：稳定异常标识与证据摘要、认可/排除处置（同摘要仅一次/单号幂等冲突）、惰性失效对账（anomaly_gone/evidence_changed）、当前异常查询与处置台账
 │   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）、整批对账（BatchReconciliationIn）、案卷（DossierIn）、复核（ReviewIn）、人员（PersonIn/AliasIn）、测温（TempConfigIn/TempReadingIn/CalibrationIn/CalibrationVoidIn）、异常处置（AnomalyDispositionIn）按类型必填校验
-│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次/对账表、版本表与基线补建、案卷表、复核案/意见表、人员/别名表、测温配置/读数表、异常处置表与同摘要有效唯一索引）、IMMEDIATE 事务
+│   ├── db.py         # SQLite 连接、一次性可恢复启动升级（建表/旧库补列/索引/版本 0 基线单事务提交、schema_meta 结构版本标记、并发启动锁等待与重试）、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等，含运输测温演示）
 │   └── config.py     # 环境变量配置
 ├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、整批对账签收、版本复核、案卷封存与双人复核、人员标识与复核回避、运输测温证据、校准证明与可信复核、可信测温异常处置全流程）
@@ -1463,7 +1504,8 @@ python -m tests.test_dispositions   # 可信测温异常处置：69 项断言（
 ├── tests/test_temperature.py # 运输测温证据端到端自测（83 项断言，含并发）
 ├── tests/test_calibrations.py # 设备校准证明与可信复核端到端自测（58 项断言，含并发）
 ├── tests/test_dispositions.py # 可信测温异常处置端到端自测（69 项断言，含失效对账与并发）
-├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
+├── tests/test_startup_upgrade.py # 启动升级端到端自测（47 项断言，含失败回滚、并发启动、旧库基线）
+├── entrypoint.sh     # 容器入口：启动升级 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

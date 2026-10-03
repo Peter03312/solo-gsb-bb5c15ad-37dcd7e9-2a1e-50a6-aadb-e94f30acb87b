@@ -1,5 +1,6 @@
 """SQLite 连接、建表初始化与底层读写工具。"""
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -7,6 +8,14 @@ from typing import Any, Iterator
 from . import config
 
 SCHEMA = """
+-- 启动升级标记：结构版本在全部升级步骤（建表/旧库补列/索引/版本 0 基线）于单个
+-- 事务提交后才写入本表；标记存在即升级完整，缺失即需要（重新）升级。并发启动时
+-- 后到进程据此沿用先到进程已完成的升级结果，不重复构建基线。
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sample (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     sample_code         TEXT NOT NULL UNIQUE,            -- 样本编号（业务唯一）
@@ -307,6 +316,14 @@ _MIGRATION_COLUMNS = {
     ],
 }
 
+# 当前结构版本：全部升级步骤在单个事务中提交后才把该版本写入 schema_meta。
+# 后续结构演进在此递增并追加对应迁移步骤。
+SCHEMA_VERSION = "1"
+
+# 并发启动竞争写锁（database is locked）时的整体重试次数；每次尝试内部
+# 还会按 DB_TIMEOUT 等待写锁。升级幂等，重试永远安全。
+_UPGRADE_MAX_ATTEMPTS = 3
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -345,23 +362,105 @@ def db_session(commit: bool = True, immediate: bool = False) -> Iterator[sqlite3
         conn.close()
 
 
-def init_db() -> None:
-    """进程启动时建表（幂等），并对旧库执行增量迁移。"""
-    with db_session() as conn:
-        conn.executescript(SCHEMA)
-        for table, columns in _MIGRATION_COLUMNS.items():
-            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            for name, decl in columns:
-                if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-        for stmt in POST_MIGRATION_INDEXES:
-            conn.execute(stmt)
-    # 升级前已有样本：以升级时状态补建版本 0 基线（不推断更早历史）。
-    # 惰性导入避免 db ↔ service 的模块级循环依赖。
+def _split_statements(script: str) -> list[str]:
+    """把多语句 SQL 脚本拆成单条语句（sqlite3.complete_statement 判定语句边界）。
+
+    executescript 会先隐式 COMMIT 再以自动提交模式逐条执行，无法纳入升级事务；
+    启动升级改为逐条 execute，使 DDL 与其余步骤在同一事务中提交或回滚。
+    """
+    statements: list[str] = []
+    buf = ""
+    for line in script.splitlines(keepends=True):
+        buf += line
+        if sqlite3.complete_statement(buf):
+            statements.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        raise ValueError("SCHEMA 脚本存在未闭合的 SQL 语句")
+    return statements
+
+
+def _applied_schema_version(conn: sqlite3.Connection) -> str | None:
+    """已完整提交的结构版本；无标记（全新库 / 旧库 / 升级从未完整提交）返回 None。"""
+    try:
+        row = conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return None  # schema_meta 尚不存在：旧库或全新库
+    return None if row is None else row["value"]
+
+
+def _apply_upgrade(conn: sqlite3.Connection) -> int:
+    """在调用方事务内执行完整升级：建表 → 旧库补列 → 索引 → 版本 0 基线 → 版本标记。
+
+    每步均幂等（IF NOT EXISTS / 存在性检查），任一步失败由调用方整体回滚，
+    重试时从干净状态重新执行；已有版本、案卷与复核记录一律不重写。
+    返回本次补建的版本 0 基线条数。
+    """
+    for stmt in _split_statements(SCHEMA):
+        conn.execute(stmt)
+    for table, columns in _MIGRATION_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    for stmt in POST_MIGRATION_INDEXES:
+        conn.execute(stmt)
+    # 升级前已有样本：以升级时状态补建版本 0 基线（不推断更早历史）；
+    # 已有任何版本的样本跳过。惰性导入避免 db ↔ service 的模块级循环依赖。
     from .versions import ensure_version_baselines
 
-    with db_session(immediate=True) as conn:
-        ensure_version_baselines(conn)
+    created = ensure_version_baselines(conn)
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SCHEMA_VERSION,),
+    )
+    return created
+
+
+def init_db() -> None:
+    """进程启动时执行一次性、可恢复的结构升级（幂等，可任意重复调用）。
+
+    建表、旧库补列、索引与版本 0 基线作为**一次**升级，在单个 BEGIN IMMEDIATE
+    事务内完成：任一步失败整体回滚，不留下部分升级结果；异常向上抛出，
+    调用方（entrypoint / lifespan）随之终止启动，失败进程不对外服务。
+
+    并发启动同一持久库：先到进程持写锁完成升级并写入结构版本标记；后到进程
+    在写锁上等待，进入事务后复查标记——升级已完成即直接沿用，每份旧样本的
+    版本 0 基线只构建一次。锁竞争超时后整体重试（升级幂等，重试安全）。
+    """
+    last_error: Exception | None = None
+    for attempt in range(_UPGRADE_MAX_ATTEMPTS):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = get_connection()
+            # 快路径：已完整升级（含其他进程刚完成的）直接返回，不竞争写锁
+            if _applied_schema_version(conn) == SCHEMA_VERSION:
+                return
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # 等待写锁期间其他进程可能已完成升级：事务内复查，沿用已完成状态
+                if _applied_schema_version(conn) != SCHEMA_VERSION:
+                    created = _apply_upgrade(conn)
+                    print(f"[init_db] 启动升级完成：结构版本 {SCHEMA_VERSION}，"
+                          f"补建版本 0 基线 {created} 条")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            return
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower():
+                raise
+            print(f"[init_db] 等待并发启动的升级释放写锁，第 {attempt + 1} 次重试 ...")
+        finally:
+            if conn is not None:
+                conn.close()
+        time.sleep(0.2 * (attempt + 1))
+    raise RuntimeError(
+        f"数据库启动升级失败（重试 {_UPGRADE_MAX_ATTEMPTS} 次后放弃）: {last_error}"
+    )
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
