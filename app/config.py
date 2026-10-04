@@ -18,3 +18,7 @@ LOCK_AFTER_APPROVAL = os.getenv("LOCK_AFTER_APPROVAL", "true").lower() in ("1", 
 
 # SQLite 写锁等待秒数
 DB_TIMEOUT = float(os.getenv("DB_TIMEOUT", "10"))
+
+# 启动升级等待秒数：并发启动时后到进程等待先到进程完成升级（建表/补列/索引/版本 0 基线）
+# 的最长秒数；超时仍未完成则启动失败，进程不对外服务（修复原因后重启即可恢复重试）
+UPGRADE_LOCK_TIMEOUT = float(os.getenv("UPGRADE_LOCK_TIMEOUT", "60"))

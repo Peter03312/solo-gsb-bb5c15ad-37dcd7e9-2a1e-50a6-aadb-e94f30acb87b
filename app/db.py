@@ -1,5 +1,7 @@
 """SQLite 连接、建表初始化与底层读写工具。"""
 import sqlite3
+import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterator
@@ -307,6 +309,11 @@ _MIGRATION_COLUMNS = {
     ],
 }
 
+# 启动升级版本号（写入 SQLite user_version，随升级事务一同提交/回滚）：
+# 1 = 建表 + 旧库补列 + 索引 + 版本 0 基线 的整轮原子升级。
+# 已完成的库（user_version >= SCHEMA_VERSION）启动时直接沿用，不重复执行。
+SCHEMA_VERSION = 1
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -346,22 +353,78 @@ def db_session(commit: bool = True, immediate: bool = False) -> Iterator[sqlite3
 
 
 def init_db() -> None:
-    """进程启动时建表（幂等），并对旧库执行增量迁移。"""
-    with db_session() as conn:
-        conn.executescript(SCHEMA)
-        for table, columns in _MIGRATION_COLUMNS.items():
-            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-            for name, decl in columns:
-                if name not in existing:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
-        for stmt in POST_MIGRATION_INDEXES:
-            conn.execute(stmt)
-    # 升级前已有样本：以升级时状态补建版本 0 基线（不推断更早历史）。
-    # 惰性导入避免 db ↔ service 的模块级循环依赖。
+    """进程启动初始化：把建表、旧库补列、索引与版本 0 基线作为一次可恢复升级。
+
+    * 原子：全部步骤在同一 `BEGIN IMMEDIATE` 事务内执行，任一步失败整体回滚，
+      不留下部分升级结果（SQLite 的 DDL 与 user_version 均随事务回滚）；
+      修复原因后重启即从头重试（各步骤幂等），升级可恢复。
+    * 并发：同一持久库被两个服务进程同时启动时，先到进程持写锁完成升级，
+      后到进程在 `UPGRADE_LOCK_TIMEOUT` 内等待锁释放，随后读到已提交的
+      `user_version` 直接沿用已完成状态——每份旧样本的版本 0 基线只构建一次。
+    * 失败即不服务：升级在限定时长内仍无法完成（锁长期被占、磁盘错误等）时
+      抛出异常，启动流程（entrypoint / lifespan）随之失败，进程不对外服务。
+    * 不重写历史：基线仅以升级时状态为尚无版本的旧样本补建版本 0，
+      已有版本、案卷与复核记录一律不改写。
+    """
+    deadline = time.monotonic() + config.UPGRADE_LOCK_TIMEOUT
+    waited = False
+    while True:
+        try:
+            with db_session(immediate=True) as conn:
+                current = conn.execute("PRAGMA user_version").fetchone()[0]
+                if current >= SCHEMA_VERSION:
+                    # 已完成（含并发场景下先到进程刚提交的结果），直接沿用
+                    return
+                created = _apply_upgrade(conn)
+            if created:
+                print(f"[init_db] 升级完成：为 {created} 份旧样本补建版本 0 基线", file=sys.stderr)
+            if waited:
+                print("[init_db] 已等待到其它进程释放升级锁，本轮升级完成", file=sys.stderr)
+            return
+        except sqlite3.OperationalError as exc:
+            # 仅锁竞争可等待重试；其余错误（磁盘满、权限、数据异常等）立即失败
+            if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                raise
+            if not waited:
+                waited = True
+                print("[init_db] 另一进程正在执行启动升级，等待其完成 ...", file=sys.stderr)
+            time.sleep(0.1)
+
+
+def _split_statements(script: str) -> list[str]:
+    """把建表脚本拆成单条语句（脚本内的字符串字面量与注释均不含 ASCII 分号）。
+
+    不能用 executescript：它会先隐式提交，破坏升级事务的整体回滚能力。
+    """
+    return [s.strip() for s in script.split(";") if s.strip()]
+
+
+def _apply_upgrade(conn: sqlite3.Connection) -> int:
+    """在调用方持有的升级事务内执行整轮升级（任一步失败随事务整体回滚）。
+
+    返回本次补建的版本 0 基线条数（供提交后记录日志）。
+    """
+    # 1) 建表与内置索引（IF NOT EXISTS，对新库建全量、对旧库补齐缺失）
+    for stmt in _split_statements(SCHEMA):
+        conn.execute(stmt)
+    # 2) 旧库增量补列（逐列检查，已存在则跳过）
+    for table, columns in _MIGRATION_COLUMNS.items():
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    # 3) 依赖迁移新列的索引（须在补列之后创建）
+    for stmt in POST_MIGRATION_INDEXES:
+        conn.execute(stmt)
+    # 4) 版本 0 基线：为尚无版本的旧样本以升级时状态各补建一条 baseline，
+    #    不推断更早历史；已有版本/案卷/复核记录不改写。幂等，逐样本跳过已完成者。
+    #    惰性导入避免 db ↔ service 的模块级循环依赖。
     from .versions import ensure_version_baselines
 
-    with db_session(immediate=True) as conn:
-        ensure_version_baselines(conn)
+    created = ensure_version_baselines(conn)
+    # 5) 全部步骤成功后记录升级版本号（随同事务提交/回滚）
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return created
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:

@@ -62,6 +62,9 @@ API_PREFIX = "/api/v1"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动升级：建表、旧库补列、索引与版本 0 基线作为一次原子事务执行。
+    # 任一步失败整体回滚并在此抛出 → 应用启动失败，进程不对外服务；
+    # 修复原因后重启即可从头重试（升级可恢复，各步骤幂等）。
     init_db()
     if config.SEED_ON_START:
         # 仅当库中尚无样本时写入演示数据，重启不重复
@@ -77,7 +80,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定、版本化复核、人员标识复核回避、运输测温证据复核与设备校准可信复核",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 

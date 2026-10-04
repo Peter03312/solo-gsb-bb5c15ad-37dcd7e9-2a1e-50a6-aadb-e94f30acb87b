@@ -109,9 +109,12 @@ def record_version(
 
 
 def ensure_version_baselines(conn: sqlite3.Connection) -> int:
-    """为尚无任何版本的样本补建版本 0 基线（升级迁移用）。
+    """为尚无任何版本的样本补建版本 0 基线（启动升级用），返回新建条数。
 
-    升级前已有样本以升级时状态作为版本 0，不推断更早历史；幂等。
+    升级前已有样本以升级时状态作为版本 0，不推断更早历史；幂等（逐样本跳过
+    已有版本者），已有版本、案卷与复核记录一律不改写。
+    须在调用方的升级事务内执行：基线与建表/补列/索引随同一事务提交或回滚，
+    并发启动时由写锁串行，每份旧样本只构建一次基线。
     """
     created = 0
     sample_ids = [r["id"] for r in conn.execute("SELECT id FROM sample ORDER BY id ASC").fetchall()]
